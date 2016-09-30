@@ -3,6 +3,7 @@
 import argparse
 import cv2
 import gym
+import time
 from gym.spaces import Discrete
 import numpy as np
 from scipy.signal import lfilter
@@ -11,9 +12,10 @@ import tensorflow.contrib.slim as slim
 
 parser = argparse.ArgumentParser(description=None)
 parser.add_argument('-e', '--env', default='Breakout-v3', type=str, help='gym environment')
-parser.add_argument('-b', '--batch_size', default=16, type=int, help='batch size to use during learning')
-parser.add_argument('-l', '--learning_rate', default=1e-4, type=float, help='used for Adam')
+parser.add_argument('-b', '--batch_size', default=10000, type=int, help='batch size to use during learning')
+parser.add_argument('-l', '--learning_rate', default=1e-3, type=float, help='used for Adam')
 parser.add_argument('-g', '--discount', default=0.99, type=float, help='reward discount rate to use')
+parser.add_argument('-n', '--hidden_size', default=24, type=int, help='number of hidden units in net')
 args = parser.parse_args()
 
 # -----------------------------------------------------------------------------
@@ -28,34 +30,42 @@ def process_frame(frame):
     return x
 
 def policy_spec(x):
-  conv1 = slim.conv2d(x, 10, [5, 5], stride=2, padding='SAME', scope='conv1')
+  conv1 = slim.conv2d(x, args.hidden_size, [5, 5], stride=2, padding='SAME', scope='conv1')
   conv2 = slim.conv2d(conv1, num_actions, [5, 5], stride=2, padding='SAME', activation_fn=None, scope='conv2')
   action_logits = tf.reduce_mean(conv2, [1,2]) # average pool across space
   return action_logits
 
-def rollout(max_steps=-1):
+def rollout(n, max_steps_per_episode=4500):
   """ gather a single episode with current policy """
 
-  observations = []
-  actions = []
-  rewards = []
+  observations, actions, rewards = [], [], []
   ob = env.reset()
-  done = False
-  while not done and (len(rewards) < max_steps or max_steps==-1):
+  ep_steps = 0
+  ep_reward = 0
+  ep_rewards = []
+  while len(rewards) < n:
 
     # run the policy
     obf = np.expand_dims(process_frame(ob), 0) # intro a batch dim
-    action = sess.run(action_index, feed_dict={x: obf}) # (batch_size, num_samples)
+    action = sess.run(action_index, feed_dict={x: obf})
     action = action[0][0] # strip batch and #samples from tf.multinomial
 
     # execute the action
     ob, reward, done, info = env.step(action)
+    ep_steps += 1
+    ep_reward += reward
 
     observations.append(obf[0])
     actions.append(action)
     rewards.append(reward)
 
-  return np.stack(observations), np.stack(actions), np.stack(rewards)
+    if done or ep_steps >= max_steps_per_episode:
+      ep_steps = 0
+      ep_rewards.append(ep_reward)
+      ep_reward = 0
+      ob = env.reset()
+
+  return np.stack(observations), np.stack(actions), np.stack(rewards), {'ep_rewards':ep_rewards}
 
 def discount(x, gamma): 
   return lfilter([1],[1,-gamma],x[::-1])[::-1]
@@ -67,6 +77,7 @@ def standardize(v):
 # create the environment
 env = gym.make(args.env)
 num_actions = env.action_space.n
+
 # compile the model
 x = tf.placeholder(tf.float32, (None,) + (42,42,1), name='x')
 action_logits = policy_spec(x)
@@ -81,20 +92,18 @@ train_op = optimizer.minimize(loss)
 # tf init
 sess = tf.Session()
 sess.run(tf.initialize_all_variables())
-
+n = 0
 while True: # loop forever
-  
+  n += 1
+
   # collect a batch of data from a rollout
-  observations, actions, rewards = rollout()
-  discounted_rewards_np = standardize(discount(rewards, args.discount))
-
+  t0 = time.time()
+  observations, actions, rewards, info = rollout(args.batch_size)
+  print 'step %d: collected %d frames in %fs, mean episode reward = %f (%d eps)' % \
+        (n, observations.shape[0], time.time() - t0, np.mean(info['ep_rewards']), len(info['ep_rewards']))
+  
   # perform a parameter update
-  for t in xrange(0, rewards.shape[0], args.batch_size):
-
-    s = observations[t:t+args.batch_size]
-    a = actions[t:t+args.batch_size]
-    r = discounted_rewards_np[t:t+args.batch_size]
-
-    _, loss_np = sess.run([train_op, loss], feed_dict={x:s, sampled_actions:a, discounted_rewards:r})
-
-  print 'episode with %d frames, sum reward = %f' % (rewards.shape[0], np.sum(rewards))
+  t0 = time.time()
+  discounted_rewards_np = standardize(discount(rewards, args.discount))
+  _, loss_np = sess.run([train_op, loss], feed_dict={x:observations, sampled_actions:actions, discounted_rewards:discounted_rewards_np})
+  print 'processed in %fs' % (time.time() - t0)
