@@ -41,9 +41,8 @@ def rollout(n, max_steps_per_episode=4500):
   observations, actions, rewards = [], [], []
   ob = env.reset()
   ep_steps = 0
-  ep_reward = 0
-  ep_rewards = []
-  while len(rewards) < n:
+  num_episodes = 0
+  while True:
 
     # run the policy
     obf = np.expand_dims(process_frame(ob), 0) # intro a batch dim
@@ -53,19 +52,18 @@ def rollout(n, max_steps_per_episode=4500):
     # execute the action
     ob, reward, done, info = env.step(action)
     ep_steps += 1
-    ep_reward += reward
 
     observations.append(obf[0])
     actions.append(action)
     rewards.append(reward)
 
     if done or ep_steps >= max_steps_per_episode:
+      num_episodes += 1
       ep_steps = 0
-      ep_rewards.append(ep_reward)
-      ep_reward = 0
       ob = env.reset()
+      if len(rewards) >= n: break
 
-  return np.stack(observations), np.stack(actions), np.stack(rewards), {'ep_rewards':ep_rewards}
+  return np.stack(observations), np.stack(actions), np.stack(rewards), {'num_episodes':num_episodes}
 
 def discount(x, gamma): 
   return lfilter([1],[1,-gamma],x[::-1])[::-1]
@@ -99,11 +97,12 @@ while True: # loop forever
   # collect a batch of data from a rollout
   t0 = time.time()
   observations, actions, rewards, info = rollout(args.batch_size)
-  print 'step %d: collected %d frames in %fs, mean episode reward = %f (%d eps)' % \
-        (n, observations.shape[0], time.time() - t0, np.mean(info['ep_rewards']), len(info['ep_rewards']))
   
   # perform a parameter update
-  t0 = time.time()
+  t1 = time.time()
   discounted_rewards_np = standardize(discount(rewards, args.discount))
   _, loss_np = sess.run([train_op, loss], feed_dict={x:observations, sampled_actions:actions, discounted_rewards:discounted_rewards_np})
-  print 'processed in %fs' % (time.time() - t0)
+  t2 = time.time()
+
+  print 'step %d: collected %d frames in %fs, mean episode reward = %f (%d eps), update in %fs' % \
+        (n, observations.shape[0], t1-t0, np.sum(rewards)/info['num_episodes'], info['num_episodes'], t2-t1)
