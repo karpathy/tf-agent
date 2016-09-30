@@ -42,24 +42,31 @@ def rollout(n, max_steps_per_episode=4500):
   ob = env.reset()
   ep_steps = 0
   num_episodes = 0
+  prev_obf = None
   while True:
 
+    # we concatenate the previous frame to get some motion information
+    obf_now = process_frame(ob)
+    obf_before = obf_now if prev_obf is None else prev_obf
+    obf = np.concatenate((obf_before, obf_now), axis=2)
+    prev_obf = obf_now
+
     # run the policy
-    obf = np.expand_dims(process_frame(ob), 0) # intro a batch dim
-    action = sess.run(action_index, feed_dict={x: obf})
+    action = sess.run(action_index, feed_dict={x: np.expand_dims(obf, 0)}) # intro a batch dim
     action = action[0][0] # strip batch and #samples from tf.multinomial
 
     # execute the action
     ob, reward, done, info = env.step(action)
     ep_steps += 1
 
-    observations.append(obf[0])
+    observations.append(obf)
     actions.append(action)
     rewards.append(reward)
 
     if done or ep_steps >= max_steps_per_episode:
       num_episodes += 1
       ep_steps = 0
+      prev_obf = None
       ob = env.reset()
       if len(rewards) >= n: break
 
@@ -77,13 +84,13 @@ env = gym.make(args.env)
 num_actions = env.action_space.n
 
 # compile the model
-x = tf.placeholder(tf.float32, (None,) + (42,42,1), name='x')
+x = tf.placeholder(tf.float32, (None,) + (42,42,2), name='x')
 action_logits = policy_spec(x)
 action_index = tf.multinomial(action_logits - tf.reduce_max(action_logits, 1, keep_dims=True), 1) # take 1 sample
 # compile the loss
 sampled_actions = tf.placeholder(tf.int32, (None,), name='sampled_actions')
-discounted_rewards = tf.placeholder(tf.float32, (None,), name='discounted_rewards')
-loss = tf.reduce_mean(discounted_rewards * tf.nn.sparse_softmax_cross_entropy_with_logits(action_logits, sampled_actions))
+advantage = tf.placeholder(tf.float32, (None,), name='advantage')
+loss = tf.reduce_mean(advantage * tf.nn.sparse_softmax_cross_entropy_with_logits(action_logits, sampled_actions))
 optimizer = tf.train.AdamOptimizer(learning_rate=args.learning_rate)
 train_op = optimizer.minimize(loss)
 
@@ -100,9 +107,9 @@ while True: # loop forever
   
   # perform a parameter update
   t1 = time.time()
-  discounted_rewards_np = standardize(discount(rewards, args.discount))
-  _, loss_np = sess.run([train_op, loss], feed_dict={x:observations, sampled_actions:actions, discounted_rewards:discounted_rewards_np})
+  empirical_advantage = standardize(discount(rewards, args.discount))
+  _, loss_np = sess.run([train_op, loss], feed_dict={x:observations, sampled_actions:actions, advantage:empirical_advantage})
   t2 = time.time()
 
-  print 'step %d: collected %d frames in %fs, mean episode reward = %f (%d eps), update in %fs' % \
-        (n, observations.shape[0], t1-t0, np.sum(rewards)/info['num_episodes'], info['num_episodes'], t2-t1)
+  print 'step %d: collected %d frames in %fs, mean episode reward = %f (%d eps), loss = %f, update in %fs' % \
+        (n, observations.shape[0], t1-t0, np.sum(rewards)/info['num_episodes'], info['num_episodes'], loss_np, t2-t1)
