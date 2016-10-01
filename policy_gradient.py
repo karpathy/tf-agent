@@ -1,4 +1,4 @@
-""" implements a simple policy gradient agent """
+""" implements a simple policy gradient (actor critic technically) agent """
 
 import argparse
 import cv2
@@ -15,7 +15,8 @@ parser.add_argument('-e', '--env', default='Breakout-v3', type=str, help='gym en
 parser.add_argument('-b', '--batch_size', default=10000, type=int, help='batch size to use during learning')
 parser.add_argument('-l', '--learning_rate', default=1e-3, type=float, help='used for Adam')
 parser.add_argument('-g', '--discount', default=0.99, type=float, help='reward discount rate to use')
-parser.add_argument('-n', '--hidden_size', default=24, type=int, help='number of hidden units in net')
+parser.add_argument('-n', '--hidden_size', default=12, type=int, help='number of hidden units in net')
+parser.add_argument('-c', '--gradient_clip', default=40.0, type=float, help='clip at this max norm of gradient')
 args = parser.parse_args()
 
 # -----------------------------------------------------------------------------
@@ -30,18 +31,22 @@ def process_frame(frame):
     return x
 
 def policy_spec(x):
-  conv1 = slim.conv2d(x, args.hidden_size, [5, 5], stride=2, padding='SAME', scope='conv1')
-  conv2 = slim.conv2d(conv1, num_actions, [5, 5], stride=2, padding='SAME', activation_fn=None, scope='conv2')
-  action_logits = tf.reduce_mean(conv2, [1,2]) # average pool across space
-  return action_logits
+  net = slim.conv2d(x, args.hidden_size, [5, 5], stride=2, padding='SAME', activation_fn=tf.nn.elu, scope='conv1')
+  net = slim.conv2d(net, args.hidden_size*2, [5, 5], stride=2, padding='SAME', activation_fn=tf.nn.elu, scope='conv2')
+  net = slim.conv2d(net, args.hidden_size*2, [5, 5], stride=2, padding='SAME', activation_fn=tf.nn.elu, scope='conv3')
+  net = slim.flatten(net)
+  action_logits = slim.fully_connected(net, num_actions, activation_fn=None, scope='fc_act')
+  value_function = slim.fully_connected(net, 1, activation_fn=None, scope='fc_value')
+  return action_logits, value_function
 
 def rollout(n, max_steps_per_episode=4500):
   """ gather a single episode with current policy """
 
-  observations, actions, rewards = [], [], []
+  observations, actions, rewards, discounted_rewards = [], [], [], []
   ob = env.reset()
   ep_steps = 0
   num_episodes = 0
+  ep_start_pointer = 0
   prev_obf = None
   while True:
 
@@ -53,7 +58,7 @@ def rollout(n, max_steps_per_episode=4500):
 
     # run the policy
     action = sess.run(action_index, feed_dict={x: np.expand_dims(obf, 0)}) # intro a batch dim
-    action = action[0][0] # strip batch and #samples from tf.multinomial
+    action = action[0][0] # strip batch and #of samples from tf.multinomial
 
     # execute the action
     ob, reward, done, info = env.step(action)
@@ -67,16 +72,15 @@ def rollout(n, max_steps_per_episode=4500):
       num_episodes += 1
       ep_steps = 0
       prev_obf = None
+      discounted_rewards.append(discount(rewards[ep_start_pointer:], args.discount))
+      ep_start_pointer = len(rewards)
       ob = env.reset()
       if len(rewards) >= n: break
 
-  return np.stack(observations), np.stack(actions), np.stack(rewards), {'num_episodes':num_episodes}
+  return np.stack(observations), np.stack(actions), np.stack(rewards), np.concatenate(discounted_rewards), {'num_episodes':num_episodes}
 
 def discount(x, gamma): 
   return lfilter([1],[1,-gamma],x[::-1])[::-1]
-
-def standardize(v):
-  return (v-np.mean(v))/np.std(v) if v.any() else v
 # -----------------------------------------------------------------------------
 
 # create the environment
@@ -85,14 +89,25 @@ num_actions = env.action_space.n
 
 # compile the model
 x = tf.placeholder(tf.float32, (None,) + (42,42,2), name='x')
-action_logits = policy_spec(x)
+action_logits, value_function = policy_spec(x)
 action_index = tf.multinomial(action_logits - tf.reduce_max(action_logits, 1, keep_dims=True), 1) # take 1 sample
-# compile the loss
+# compile the loss: 1) the policy gradient
 sampled_actions = tf.placeholder(tf.int32, (None,), name='sampled_actions')
-advantage = tf.placeholder(tf.float32, (None,), name='advantage')
-loss = tf.reduce_mean(advantage * tf.nn.sparse_softmax_cross_entropy_with_logits(action_logits, sampled_actions))
+discounted_reward = tf.placeholder(tf.float32, (None,), name='discounted_reward')
+pg_loss = tf.reduce_mean((discounted_reward - value_function) * tf.nn.sparse_softmax_cross_entropy_with_logits(action_logits, sampled_actions))
+# and 2) the baseline (value function) regression piece
+value_loss = 0.5 * tf.reduce_mean(tf.square(discounted_reward - value_function))
+# and 3) entropy regularization
+#action_log_prob = tf.nn.log_softmax(action_logits)
+#entropy_loss = - 0.01 * tf.reduce_sum(action_log_prob*tf.exp(action_log_prob))
+# add up and minimize
+loss = pg_loss + value_loss #+ entropy_loss
+# create the optimizer
 optimizer = tf.train.AdamOptimizer(learning_rate=args.learning_rate)
-train_op = optimizer.minimize(loss)
+grads = tf.gradients(loss, tf.trainable_variables())
+grads, _ = tf.clip_by_global_norm(grads, args.gradient_clip) # gradient clipping
+grads_and_vars = list(zip(grads, tf.trainable_variables()))
+train_op = optimizer.apply_gradients(grads_and_vars)
 
 # tf init
 sess = tf.Session()
@@ -101,15 +116,12 @@ n = 0
 while True: # loop forever
   n += 1
 
-  # collect a batch of data from a rollout
+  # collect a batch of data from rollouts and do forward/backward/update
   t0 = time.time()
-  observations, actions, rewards, info = rollout(args.batch_size)
-  
-  # perform a parameter update
+  observations, actions, rewards, discounted_reward_np, info = rollout(args.batch_size)
   t1 = time.time()
-  empirical_advantage = standardize(discount(rewards, args.discount))
-  _, loss_np = sess.run([train_op, loss], feed_dict={x:observations, sampled_actions:actions, advantage:empirical_advantage})
+  sess.run(train_op, feed_dict={x:observations, sampled_actions:actions, discounted_reward:discounted_reward_np})
   t2 = time.time()
 
-  print 'step %d: collected %d frames in %fs, mean episode reward = %f (%d eps), loss = %f, update in %fs' % \
-        (n, observations.shape[0], t1-t0, np.sum(rewards)/info['num_episodes'], info['num_episodes'], loss_np, t2-t1)
+  print 'step %d: collected %d frames in %fs, mean episode reward = %f (%d eps), update in %fs' % \
+        (n, observations.shape[0], t1-t0, np.sum(rewards)/info['num_episodes'], info['num_episodes'], t2-t1)
